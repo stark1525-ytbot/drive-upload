@@ -1,4 +1,13 @@
 import asyncio
+
+# --- FIX FOR THE 'NO CURRENT EVENT LOOP' ERROR ---
+# This must be at the very top before any other imports
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 import os
 import json
 import time
@@ -15,14 +24,13 @@ web_app = Flask(__name__)
 
 @web_app.route('/')
 def home():
-    return "Bot is running!"
+    return "Bot is alive and running!"
 
 def run_web():
-    # Render provides a PORT environment variable
     port = int(os.environ.get("PORT", 8080))
     web_app.run(host='0.0.0.0', port=port)
 
-# --- BOT LOGIC ---
+# --- BOT CONFIG ---
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -45,7 +53,7 @@ def get_readable_size(size_in_bytes):
 async def edit_status(status_msg, current, total, start_time):
     now = time.time()
     diff = now - start_time
-    if diff < 2: return # Update every 2 seconds to avoid flood
+    if diff < 2: return 
     percentage = current * 100 / total
     speed = current / diff
     bar = "".join(["▰" for i in range(math.floor(percentage / 10))]).ljust(10, "▱")
@@ -89,16 +97,18 @@ async def upload_to_drive_async(file_generator, file_name, total_size, status_ms
 @app.on_message(filters.document | filters.video)
 async def handle_tg_file(client, message: Message):
     media = message.document or message.video
-    status_msg = await message.reply_text("🔄 Starting Stream...")
+    status_msg = await message.reply_text("🔄 Connecting to Google Drive...")
     file_generator = client.stream_media(message)
     try:
         await upload_to_drive_async(file_generator, media.file_name, media.file_size, status_msg)
-        await status_msg.edit(f"✅ **Uploaded:** `{media.file_name}`")
+        await status_msg.edit(f"✅ **Success!**\nFile: `{media.file_name}`")
     except Exception as e:
-        await status_msg.edit(f"❌ **Error:** `{e}`")
+        await status_msg.edit(f"❌ **Error:** `{str(e)}`")
 
 if __name__ == "__main__":
-    # Start the web server in a separate thread
+    # Start Web Server for Render
     Thread(target=run_web).start()
-    print("Web server started. Starting Bot...")
+    print("Web server live. Starting Bot loop...")
+    
+    # Standard Pyrogram run
     app.run()
