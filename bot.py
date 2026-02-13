@@ -5,17 +5,17 @@ except RuntimeError:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-import os, json, time, math, aiohttp
+import os, json, time, math, aiohttp, sys
 from flask import Flask
 from threading import Thread
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from google.oauth2 import service_account
 
-# --- WEB SERVER FOR RENDER ---
+# --- WEB SERVER ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def home(): return "Bot is optimized for Low RAM (100MB Update Interval)."
+def home(): return "Bot is Active"
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -28,10 +28,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
 SERVICE_ACCOUNT_INFO = json.loads(os.environ.get("SERVICE_ACCOUNT_JSON"))
 
-# GLOBAL LIMITS
 upload_semaphore = asyncio.Semaphore(1) 
 CANCEL_TASKS = {}
-UPDATE_THRESHOLD = 100 * 1024 * 1024  # 100 MB
+# Set to 50MB for better visibility in logs
+LOG_THRESHOLD = 50 * 1024 * 1024 
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
 creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
@@ -48,15 +48,13 @@ async def edit_status(status_msg, current, total, start_time, task_id):
     speed = current / (time.time() - start_time) if (time.time() - start_time) > 0 else 0
     bar = "".join(["▰" for i in range(math.floor(percentage / 10))]).ljust(10, "▱")
     
-    text = (f"📤 **Low-RAM Upload Mode**\n"
+    text = (f"📤 **Low-RAM Upload**\n"
             f"[{bar}] {round(percentage, 2)}%\n"
             f"🚀 Speed: {get_readable_size(speed)}/s\n"
-            f"📦 Uploaded: {get_readable_size(current)} / {get_readable_size(total)}\n\n"
-            f"⏳ *Next status update at +100MB...*")
+            f"📦 Uploaded: {get_readable_size(current)} / {get_readable_size(total)}")
     
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{task_id}")]])
-    try:
-        await status_msg.edit(text, reply_markup=markup)
+    try: await status_msg.edit(text, reply_markup=markup)
     except: pass
 
 async def upload_to_drive_async(file_generator, file_name, total_size, status_msg, task_id):
@@ -68,36 +66,36 @@ async def upload_to_drive_async(file_generator, file_name, total_size, status_ms
     metadata = {'name': file_name, 'parents': [DRIVE_FOLDER_ID]}
     
     async with aiohttp.ClientSession() as session:
-        # Start Session
         async with session.post(
             "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
             headers=headers, json=metadata
         ) as resp:
             session_url = resp.headers.get("Location")
 
-        print(f"INITIATED: {file_name}")
+        # FORCE PRINT IMMEDIATELY
+        print(f"DEBUG: Starting real-time stream for {file_name} ({get_readable_size(total_size)})", flush=True)
+        
         start_time = time.time()
         uploaded = 0
-        last_update_size = 0
+        last_log_size = 0
         
         async for chunk in file_generator:
             if CANCEL_TASKS.get(task_id): return "CANCELLED"
             if not chunk: break
             
-            length = len(chunk)
             chunk_headers = {
-                "Content-Range": f"bytes {uploaded}-{uploaded + length - 1}/{total_size}",
-                "Content-Length": str(length)
+                "Content-Range": f"bytes {uploaded}-{uploaded + len(chunk) - 1}/{total_size}",
+                "Content-Length": str(len(chunk))
             }
             
             async with session.put(session_url, headers=chunk_headers, data=chunk) as r:
-                uploaded += length
+                uploaded += len(chunk)
                 
-                # Check if we passed the 100MB mark or if file is finished
-                if (uploaded - last_update_size) >= UPDATE_THRESHOLD or uploaded == total_size:
-                    print(f"LOG: {file_name} Progress -> {get_readable_size(uploaded)}")
+                # Update every 50MB in logs
+                if (uploaded - last_log_size) >= LOG_THRESHOLD or uploaded == total_size:
+                    print(f"PROGRESS: {file_name} -> {get_readable_size(uploaded)} completed", flush=True)
                     await edit_status(status_msg, uploaded, total_size, start_time, task_id)
-                    last_update_size = uploaded
+                    last_log_size = uploaded
 
         return "SUCCESS"
 
@@ -106,37 +104,24 @@ async def handle_tg_file(client, message: Message):
     media = message.document or message.video
     task_id = str(message.id)
     CANCEL_TASKS[task_id] = False
-
-    status_msg = await message.reply_text("⏳ Queued... waiting for RAM to clear.")
+    
+    print(f"RECEIVED: New file request - {media.file_name}", flush=True)
+    status_msg = await message.reply_text("⏳ Queued... checking Render RAM.")
     
     async with upload_semaphore:
-        await status_msg.edit(f"🔄 **Uploading {media.file_name}**\nStatus will update every 100MB.")
-        
-        # We read the file in small chunks to keep RAM usage low
+        await status_msg.edit(f"🔄 **Uploading...**\nLogs updating every 50MB.")
         file_generator = client.stream_media(message)
-        
         try:
             result = await upload_to_drive_async(file_generator, media.file_name, media.file_size, status_msg, task_id)
-            
             if result == "CANCELLED":
-                await status_msg.edit(f"❌ Cancelled: `{media.file_name}`")
+                await status_msg.edit("❌ Upload Cancelled.")
             else:
-                await status_msg.edit(f"✅ **Finished!**\n`{media.file_name}`\nTotal: {get_readable_size(media.file_size)}")
+                await status_msg.edit(f"✅ **Done!** Check Drive folder.")
         except Exception as e:
-            await status_msg.edit(f"❌ Error: `{str(e)}`")
-        finally:
-            if task_id in CANCEL_TASKS: del CANCEL_TASKS[task_id]
-
-@app.on_callback_query(filters.regex(r"^cancel_"))
-async def cancel_callback(client, query: CallbackQuery):
-    task_id = query.data.split("_")[1]
-    if task_id in CANCEL_TASKS:
-        CANCEL_TASKS[task_id] = True
-        await query.answer("Cancelling upload...")
-    else:
-        await query.answer("Already completed.")
+            print(f"CRITICAL ERROR: {e}", flush=True)
+            await status_msg.edit(f"❌ Error: `{e}`")
 
 if __name__ == "__main__":
     Thread(target=run_web).start()
-    print("Bot started. Optimization: 100MB update interval.")
+    print("BOT STARTED: Unbuffered logging enabled.", flush=True)
     app.run()
